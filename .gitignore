@@ -1,0 +1,33 @@
+# ── 私货与迁移快照：永不入库 ────────────────────────
+# legacy/ 是迁移期的原样快照，里面有作者署名、角色人设、本机路径。
+# 必须在「第一次 commit 之前」就忽略，否则 git 历史里永远留着，删不掉。
+legacy/
+
+# 私有场景档案：放仓库外，不入库
+# 放在仓库外：$LOOKKIT_PROFILES 或 ~/.config/lookkit/profiles/
+profiles/private/
+*.private.json
+
+# ── 运行产物：随时可删可重跑 ─────────────────────────
+work/
+out/
+data/
+*.local.json
+
+# ── 产物形态（图 / 库 / 报告）─────────────────────────
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.gif
+*.db
+*.sqlite
+*.sqlite3
+*.md5
+!tests/golden/*.md5
+
+# ── 语言垃圾 ────────────────────────────────────────
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
