@@ -1,0 +1,386 @@
+#!/usr/bin/env node
+// lookkit 命令行入口。零依赖，只用 Node 内置模块。
+//
+// 设计：每个子命令只管自己那一段，段与段之间靠文件交接。
+// 不知道 `look` 有哪几个子命令就跑 `look help`。
+
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { join, resolve, dirname, extname, basename } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+import { loadProfile, listProfiles, PRIVATE_PROFILES, REPO_PROFILES } from '../lib/profile.mjs'
+import { scan, writeItems, readItems, DEFAULT_EXTS } from '../lib/scan.mjs'
+import { listSheets, sheetsFor, writeBatch, loadKnown, findStale } from '../lib/batch.mjs'
+import { mergeAnnotations, writeJsonl, formatReport } from '../lib/merge.mjs'
+import { getTarget, targetNames } from '../lib/target/index.mjs'
+
+const HERE = dirname(fileURLToPath(import.meta.url))
+const REPO = join(HERE, '..')
+const PY = process.platform === 'win32' ? 'python' : 'python3'
+
+// ── 极简参数解析 ───────────────────────────────────────
+// 支持 --key value / --key=value / --flag / -k value，其余算位置参数。
+function parseArgs(argv) {
+  const flags = {}
+  const pos = []
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=')
+      if (eq > 0) { flags[a.slice(2, eq)] = a.slice(eq + 1); continue }
+      const key = a.slice(2)
+      const next = argv[i + 1]
+      if (next !== undefined && !next.startsWith('--')) { flags[key] = next; i++ }
+      else flags[key] = true
+    } else if (a.startsWith('-') && a.length === 2) {
+      flags[a.slice(1)] = argv[i + 1] && !argv[i + 1].startsWith('-') ? argv[++i] : true
+    } else {
+      pos.push(a)
+    }
+  }
+  return { flags, pos }
+}
+
+const S = (v) => (v === undefined || v === true || v === false ? '' : String(v))
+const N = (v, d) => (v === undefined || v === true ? d : Number(v))
+const listOf = (v) => (v === undefined || v === true ? [] : String(v).split(',').map((x) => x.trim()).filter(Boolean))
+
+function need(flags, key, hint) {
+  const v = S(flags[key])
+  if (!v) throw new Error(`缺 --${key}${hint ? `（${hint}）` : ''}`)
+  return v
+}
+
+function ensureDir(p) { mkdirSync(p, { recursive: true }); return p }
+
+function runPython(args, label) {
+  const r = spawnSync(PY, args, { stdio: 'inherit' })
+  if (r.error) throw new Error(`${label}: 起不动 python3 — ${r.error.message}`)
+  if (r.status !== 0) throw new Error(`${label}: python 退出码 ${r.status}`)
+}
+
+// ── 子命令 ────────────────────────────────────────────
+const CMD = {}
+
+CMD.help = {
+  desc: '看这个',
+  run() {
+    console.log(`lookkit — 视觉标注 / 二次审核流水线
+
+用法: look <子命令> [选项]
+
+  scan      扫素材 → items.jsonl（算内容 hash）
+  sheet     出证据图（frames 动图抽帧 / tiles 多图拼版）
+  batch     生成待处理清单，或找新增/改动的件
+  prompt    渲染一份场景 prompt（把路径注进去，交给 AI）
+  merge     合并多份标注 + 清洗 + 校验
+  review    起人工审核面板
+  export    导出成目标格式
+  import    把清单入库
+  inbox     起收件箱（手机传图）
+  overview  全库核对拼图
+  profiles  列出可用场景档案
+
+示例:
+  look scan ./素材 --out work/items.jsonl
+  look sheet --mode tiles --in ./素材 --out work/sheets --tile 240 --per 24
+  look prompt --profile example-catalog --kind annotate --workdir work
+  look merge --profile example-catalog --in work/annot/ai.jsonl --out work/annot/merged.jsonl
+  look review --profile example-catalog --data work/annot/merged.jsonl --raw ./素材
+  look export --profile example-catalog --target catalog-json --in work/annot/merged.jsonl --out out/catalog.json
+
+profile 查找顺序: --profile-dir > $LOOKKIT_PROFILES > ${PRIVATE_PROFILES} > ${REPO_PROFILES}`)
+  },
+}
+
+CMD.scan = {
+  desc: '扫素材 → items.jsonl',
+  run({ flags, pos }) {
+    const input = pos[0] || S(flags.in)
+    if (!input) throw new Error('缺输入目录（或 --in）')
+    const exts = listOf(flags.ext).length
+      ? listOf(flags.ext).map((x) => (x.startsWith('.') ? x : '.' + x))
+      : DEFAULT_EXTS
+    const { items, warnings, root } = scan({
+      input,
+      exts,
+      recursive: flags.recursive !== false && flags['no-recursive'] !== true,
+      groupMode: S(flags.group) || 'auto',
+      fixedGroup: S(flags['fixed-group']),
+    })
+    for (const w of warnings) console.warn('⚠ ' + w)
+    const out = S(flags.out)
+    if (out) {
+      ensureDir(dirname(resolve(out)))
+      writeItems(items, out)
+      console.log(`${items.length} 件 → ${out}`)
+      const groups = new Map()
+      for (const it of items) groups.set(it.group || '(根)', (groups.get(it.group || '(根)') || 0) + 1)
+      for (const [g, n] of groups) console.log(`  ${g}: ${n}`)
+    } else {
+      for (const it of items) console.log(JSON.stringify(it))
+    }
+  },
+}
+
+CMD.sheet = {
+  desc: '出证据图',
+  run({ flags }) {
+    const mode = S(flags.mode) || 'tiles'
+    const out = need(flags, 'out', '输出目录')
+    ensureDir(out)
+
+    if (mode === 'frames') {
+      const src = need(flags, 'in', 'items.jsonl 或一个文件/目录')
+      const items = src.endsWith('.jsonl') ? readItems(src) : null
+      const byGroup = new Map()
+      if (items) {
+        for (const it of items) {
+          const g = it.group || ''
+          if (!byGroup.has(g)) byGroup.set(g, [])
+          byGroup.get(g).push(it.src)
+        }
+      } else {
+        byGroup.set('', listSheets(src, DEFAULT_EXTS))
+      }
+      let total = 0
+      for (const [g, files] of byGroup) {
+        if (!files.length) continue
+        const dir = g ? join(out, g) : out
+        const listFile = join(out, `.frames-list-${g.replace(/\//g, '_') || 'root'}.txt`)
+        writeFileSync(listFile, files.join('\n') + '\n')
+        runPython([
+          '-I', join(REPO, 'img/sheet_frames.py'), dir,
+          '--list', listFile,
+          '--max-frames', String(N(flags['max-frames'], 12)),
+          '--cell', String(N(flags.cell, 200)),
+          '--cols', String(N(flags.cols, 4)),
+        ], 'sheet frames')
+        total += files.length
+      }
+      console.log(`frames: ${total} 件 → ${out}`)
+      return
+    }
+
+    const src = need(flags, 'in', '目录或 items.jsonl')
+    runPython([
+      '-I', join(REPO, 'img/sheet_tiles.py'),
+      '--in', src, '--out', out,
+      '--tile', String(N(flags.tile, 240)),
+      '--per', String(N(flags.per, 24)),
+      '--cols', String(N(flags.cols, 0)),
+      '--bg', S(flags.bg) || '#222222',
+      '--label', S(flags.label) || 'number',
+    ], 'sheet tiles')
+  },
+}
+
+CMD.batch = {
+  desc: '生成清单 / 找 stale',
+  run({ flags }) {
+    const itemsPath = need(flags, 'in', 'items.jsonl')
+    const items = readItems(itemsPath)
+    const out = need(flags, 'out', '输出清单')
+
+    if (flags.stale) {
+      const knownPath = need(flags, 'known', '已知标注来源（meta.json / *.jsonl）')
+      const known = loadKnown(knownPath)
+      const stale = findStale(items, known)
+      writeFileSync(out, stale.map((s) => `${s.reason}\t${s.id}`).join('\n') + (stale.length ? '\n' : ''))
+      console.log(`stale ${stale.length} 件（共 ${items.length}）→ ${out}`)
+      for (const s of stale.slice(0, 20)) console.log(`  ${s.reason} ${s.id}`)
+      if (stale.length > 20) console.log(`  …还有 ${stale.length - 20}`)
+      return
+    }
+
+    const sheetsDir = need(flags, 'sheets', 'sheet 目录')
+    const rows = sheetsFor(items, sheetsDir, S(flags.ext) || '.jpg')
+    const absent = rows.filter((r) => !existsSync(r.sheet))
+    if (absent.length) {
+      console.warn(`⚠ 有 ${absent.length} 个 sheet 文件还不存在（先跑 look sheet？）`)
+      for (const a of absent.slice(0, 5)) console.warn('   ' + a.sheet)
+    }
+    const n = writeBatch(rows, out)
+    console.log(`${n} 行 → ${out}`)
+  },
+}
+
+CMD.prompt = {
+  desc: '渲染场景 prompt（把路径注进去）',
+  run({ flags }) {
+    const profile = loadProfile(need(flags, 'profile'), { profileDir: S(flags['profile-dir']) })
+    const kind = S(flags.kind) || 'annotate'
+    const raw = profile.promptText(kind)
+    if (!raw) throw new Error(`场景 ${profile.id} 没有 ${kind} prompt`)
+
+    // 只做「注入」，不改原文。源文件永远不动。
+    const workdir = resolve(S(flags.workdir) || 'work')
+    const sheets = resolve(S(flags.sheets) || join(workdir, 'sheets'))
+    const fillVars = (t) => String(t)
+      .replaceAll('{{WORKDIR}}', workdir)
+      .replaceAll('{{SHEETS}}', sheets)
+
+    let out = fillVars(raw)
+
+    // 历史 prompt 里可能写死了绝对路径。哪些要换、换成什么，由 profile 声明，
+    // 引擎不认任何具体路径——否则「私货」就漏进公开代码了。
+    for (const [from, to] of Object.entries(profile.prompt_substitutions || {})) {
+      out = out.split(from).join(fillVars(to))
+    }
+
+    console.log(`# 场景 ${profile.id} — ${kind}`)
+    console.log(`# 工作目录 ${workdir}`)
+    console.log(`# sheet 目录 ${sheets}`)
+    console.log('')
+    console.log(out)
+  },
+}
+
+CMD.merge = {
+  desc: '合并多份标注',
+  run({ flags }) {
+    const profile = loadProfile(need(flags, 'profile'), { profileDir: S(flags['profile-dir']) })
+    const inputs = flags.in ? String(flags.in).split(',') : []
+    if (!inputs.length) throw new Error('缺 --in（可逗号分隔多份，后面的覆盖前面的）')
+    for (const f of inputs) if (!existsSync(f)) throw new Error(`输入不存在: ${f}`)
+
+    const items = S(flags.items) ? readItems(S(flags.items)) : null
+    const { entries, report } = mergeAnnotations(inputs, profile, { items })
+    writeJsonl(entries, need(flags, 'out'))
+
+    console.log(formatReport(report, { quiet: flags.quiet === true }))
+    console.log(`\n${entries.length} 条 → ${flags.out}`)
+    if (report.errors.length || report.invalid.length) process.exitCode = 1
+  },
+}
+
+CMD.review = {
+  desc: '起审核面板',
+  async run({ flags }) {
+    const profile = loadProfile(need(flags, 'profile'), { profileDir: S(flags['profile-dir']) })
+    const { startReviewServer } = await import('../lib/review-server.mjs')
+    await startReviewServer({
+      data: need(flags, 'data', 'merged.jsonl'),
+      raw: S(flags.raw) || null,
+      port: N(flags.port, 18090),
+      bind: S(flags.bind) || '127.0.0.1',
+      token: S(flags.token),
+      profile,
+      stateFile: S(flags.state) || join(dirname(resolve(S(flags.data))), 'state.json'),
+      title: S(flags.title) || null,
+    })
+  },
+}
+
+CMD.export = {
+  desc: '导出成目标格式',
+  run({ flags }) {
+    const profile = loadProfile(need(flags, 'profile'), { profileDir: S(flags['profile-dir']) })
+    const target = getTarget(need(flags, 'target', '可选: ' + targetNames().join(' / ')))
+    const entries = readFileSync(need(flags, 'in'), 'utf8')
+      .split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l))
+
+    const hashById = new Map()
+    if (S(flags.items)) for (const it of readItems(S(flags.items))) hashById.set(it.id, it.hash)
+
+    const state = S(flags.state)
+      ? JSON.parse(readFileSync(S(flags.state), 'utf8'))
+      : {}
+
+    ensureDir(dirname(resolve(need(flags, 'out'))))
+    const r = target.export(entries, profile, {
+      out: flags.out,
+      hashById,
+      raw: S(flags.raw) || null,
+      state,
+      onlyPass: flags['only-pass'] === true,
+    })
+    console.log(`导出 ${r.count} 条 → ${r.out}`)
+    if (r.missing?.length) {
+      console.warn(`⚠ 找不到源图 ${r.missing.length} 条:`)
+      for (const m of r.missing.slice(0, 8)) console.warn('   ' + m)
+    }
+  },
+}
+
+CMD.import = {
+  desc: '把清单入库',
+  async run({ flags }) {
+    const { runImport, formatImportResult } = await import('../lib/import.mjs')
+    const r = runImport({
+      listPath: need(flags, 'in', '清单 json'),
+      fromDir: need(flags, 'from', '源目录'),
+      libDir: need(flags, 'to', '库目录'),
+      prefix: S(flags.prefix) || basename(resolve(S(flags.to))) || 'img',
+      tagField: S(flags['tag-field']) || 'tag',
+      captionField: S(flags['caption-field']) || 'caption',
+      keywordsField: S(flags['keywords-field']) || 'keywords',
+      dry: flags.dry === true,
+    })
+    console.log(formatImportResult(r))
+  },
+}
+
+CMD.inbox = {
+  desc: '起收件箱',
+  async run({ flags }) {
+    const { startInboxServer } = await import('../lib/inbox-server.mjs')
+    await startInboxServer({
+      dir: need(flags, 'dir', '收件目录'),
+      port: N(flags.port, 3010),
+      bind: S(flags.bind) || '127.0.0.1',
+      token: S(flags.token),
+      title: S(flags.title) || '收件箱',
+      maxMb: N(flags['max-mb'], 12),
+    })
+  },
+}
+
+CMD.overview = {
+  desc: '全库核对拼图',
+  async run({ flags }) {
+    const { runOverview } = await import('../lib/overview.mjs')
+    const r = runOverview({
+      libDir: S(flags.lib) || null,
+      itemsPath: S(flags.items) || null,
+      out: need(flags, 'out'),
+      tile: N(flags.tile, 200),
+      per: N(flags.per, 36),
+      label: S(flags.label) || 'number',
+    })
+    console.log(`${r.rows} 张 → ${r.out}`)
+  },
+}
+
+CMD.profiles = {
+  desc: '列出场景档案',
+  run({ flags }) {
+    const rows = listProfiles({ profileDir: S(flags['profile-dir']) })
+    if (!rows.length) return console.log('一个 profile 都没有')
+    for (const r of rows) {
+      console.log(`${r.private ? '[私有]' : '[内置]'} ${r.id.padEnd(22)} ${r.name}`)
+      console.log(`        ${r.file}`)
+    }
+  },
+}
+
+// ── 分发 ──────────────────────────────────────────────
+async function main() {
+  const [cmd, ...rest] = process.argv.slice(2)
+  if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') return CMD.help.run()
+
+  const entry = CMD[cmd]
+  if (!entry) {
+    console.error(`不认识的子命令: ${cmd}\n跑 "look help" 看有哪些`)
+    process.exit(2)
+  }
+  try {
+    await entry.run(parseArgs(rest))
+  } catch (e) {
+    console.error('✗ ' + (e.message || e))
+    process.exit(1)
+  }
+}
+
+main()

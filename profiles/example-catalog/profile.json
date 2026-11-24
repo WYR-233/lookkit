@@ -3,7 +3,6 @@
   "name": "商品图标注（示例）",
   "version": 1,
   "note": "中性示例档案。演示 annotate + audit 两种模式，任何内容都不指向真实业务。",
-
   "sheet": {
     "mode": "tiles",
     "tile": 240,
@@ -13,23 +12,71 @@
     "label": "{n}",
     "_locked": "示例值，可随意改。改完记得让 prompt 的描述跟着改。"
   },
-
   "id_pattern": "{group}/{stem}",
-
   "fields": [
-    { "key": "category", "type": "enum", "fallback": "其他",
-      "values": ["服装", "鞋包", "数码", "家居", "食品", "其他"] },
-    { "key": "color",     "type": "string", "max": 20 },
-    { "key": "condition", "type": "enum", "fallback": "未知",
-      "values": ["全新", "轻微使用痕迹", "明显磨损", "破损", "未知"] },
-    { "key": "defects",   "type": "list", "max": 5, "item_max": 12 },
-    { "key": "desc",      "type": "string", "max": 120 },
-    { "key": "en",        "type": "string", "max": 40 }
+    {
+      "key": "category",
+      "type": "enum",
+      "fallback": "其他",
+      "values": [
+        "服装",
+        "鞋包",
+        "数码",
+        "家居",
+        "食品",
+        "其他"
+      ]
+    },
+    {
+      "key": "color",
+      "type": "string",
+      "max": 20
+    },
+    {
+      "key": "condition",
+      "type": "enum",
+      "fallback": "未知",
+      "values": [
+        "全新",
+        "轻微使用痕迹",
+        "明显磨损",
+        "破损",
+        "未知"
+      ]
+    },
+    {
+      "key": "defects",
+      "type": "list",
+      "max": 5,
+      "item_max": 12
+    },
+    {
+      "key": "shot_note",
+      "type": "string",
+      "default": "",
+      "note": "成片问题备注（构图/曝光），给审核面板的派生状态用"
+    },
+    {
+      "key": "desc",
+      "type": "string",
+      "max": 120
+    },
+    {
+      "key": "en",
+      "type": "string",
+      "max": 40
+    }
   ],
-
   "review": {
     "title": "商品图标注审核",
-    "display": ["category", "color", "condition", "defects", "desc", "en"],
+    "display": [
+      "category",
+      "color",
+      "condition",
+      "defects",
+      "desc",
+      "en"
+    ],
     "thumbnail": "raw",
     "checks": [
       {
@@ -44,16 +91,18 @@
       }
     ]
   },
-
   "rules": [
-    { "when": "condition == '破损'", "min_list": { "defects": 1 } }
+    {
+      "when": "condition == '破损'",
+      "min_list": {
+        "defects": 1
+      }
+    }
   ],
-
   "prompts": {
     "annotate": "prompt.annotate.md",
     "audit": "prompt.audit.md"
   },
-
   "audit": {
     "input": "work/annot/merged.jsonl",
     "output": "work/annot/audit.jsonl",
@@ -61,6 +110,7 @@
     "only_changed": true,
     "workdir": null
   },
-
-  "targets": ["catalog-json"]
+  "targets": [
+    "catalog-json"
+  ]
 }
